@@ -20,11 +20,152 @@
   ansible.builtin.set_fact:
     vbr_entra_id_install: "0"
   when: postgres.installed | bool
-- name: Create VBR silent install answer file
+- name: Create VBR silent install answer file from vendored template
   ansible.builtin.template:
     src: templates/VBR/VbrAnswerFile_install.xml.j2
     dest: "{{ destination }}VbrAnswerFile_install.xml"
     mode: '777'
+  when: not (vbr_full_version is match('^13\\.1\\.0\\.'))
+
+- name: Create VBR silent install answer file from setup media template for 13.1.0.x
+  ansible.windows.win_powershell:
+    error_action: stop
+    script: |
+      $configJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{{ vbr_answer_file_install_config_b64 }}'))
+      $config = $configJson | ConvertFrom-Json
+      $hiddenProperties = @('VBR_SERVICE_PASSWORD', 'VBR_SQLSERVER_PASSWORD')
+      $searchRoots = @(
+        (Join-Path '{{ source }}' 'Setup\\Silent'),
+        (Join-Path '{{ source }}' 'Setup')
+      )
+      $templatePath = $null
+
+      foreach ($root in $searchRoots)
+      {
+        if (-not (Test-Path -LiteralPath $root))
+        {
+          continue
+        }
+
+        $candidate = Get-ChildItem -LiteralPath $root -Filter 'VbrAnswerFile_install.xml' -File -Recurse -ErrorAction SilentlyContinue |
+          Select-Object -First 1
+
+        if ($candidate)
+        {
+          $templatePath = $candidate.FullName
+          break
+        }
+      }
+
+      if (-not $templatePath)
+      {
+        throw "Could not locate VbrAnswerFile_install.xml in setup media for version {{ vbr_full_version }}."
+      }
+
+      [xml]$xml = Get-Content -LiteralPath $templatePath -Raw -Encoding UTF8
+      $propertiesNode = $xml.unattendedInstallationConfiguration.properties
+
+      if (-not $propertiesNode)
+      {
+        throw "Setup media template at '$templatePath' did not contain a <properties> node."
+      }
+
+      function Set-AnswerProperty {
+        param(
+          [string]$Name,
+          [string]$Value,
+          [bool]$Hidden
+        )
+
+        $existing = @($propertiesNode.property | Where-Object { $_.name -eq $Name })
+
+        if ([string]::IsNullOrWhiteSpace($Value))
+        {
+          foreach ($node in $existing)
+          {
+            [void]$propertiesNode.RemoveChild($node)
+          }
+          return
+        }
+
+        $node = if ($existing.Count -gt 0) { $existing[0] } else { $xml.CreateElement('property') }
+        if ($existing.Count -eq 0)
+        {
+          [void]$propertiesNode.AppendChild($node)
+        }
+
+        [void]$node.SetAttribute('name', $Name)
+        [void]$node.SetAttribute('value', $Value)
+
+        if ($Hidden)
+        {
+          [void]$node.SetAttribute('hidden', '1')
+        }
+        elseif ($node.HasAttribute('hidden'))
+        {
+          [void]$node.RemoveAttribute('hidden')
+        }
+
+        if ($existing.Count -gt 1)
+        {
+          foreach ($extra in $existing | Select-Object -Skip 1)
+          {
+            [void]$propertiesNode.RemoveChild($extra)
+          }
+        }
+      }
+
+      foreach ($entry in $config.PSObject.Properties)
+      {
+        Set-AnswerProperty -Name $entry.Name -Value ([string]$entry.Value) -Hidden ($hiddenProperties -contains $entry.Name)
+      }
+
+      # Save XML answer file as UTF-8 (not UTF-16 LE which is .Save() default)
+      # Veeam 13.1 expects UTF-8 encoding in the answer file
+      # Must replace XML declaration encoding before save, as embedded declaration overrides StreamWriter encoding
+      $xmlString = $xml.OuterXml
+      # Use flexible regex to handle various encoding declaration formats (utf-16, UTF-16, etc.)
+      $xmlString = $xmlString -replace 'encoding=["\'].*?["\']', 'encoding="utf-8"'
+      $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+      [System.IO.File]::WriteAllText('{{ destination }}VbrAnswerFile_install.xml', $xmlString, $utf8NoBom)
+  vars:
+    vbr_answer_file_install_config_b64: >-
+      {{ {
+        'ACCEPT_EULA': '1',
+        'ACCEPT_LICENSING_POLICY': '1',
+        'ACCEPT_THIRDPARTY_LICENSES': '1',
+        'ACCEPT_REQUIRED_SOFTWARE': '1',
+        'VBR_LICENSE_FILE': (destination ~ destination_license_file) if license else '',
+        'VBR_LICENSE_AUTOUPDATE': (license_autoupdate | string) if license else '',
+        'VBR_SERVICE_USER': service_account_username if service_account_username != 'LocalSystem' else '',
+        'VBR_SERVICE_PASSWORD': service_account_password if service_account_username != 'LocalSystem' else '',
+        'VBR_SQLSERVER_INSTALL': '1' if sql_express_setup else '0',
+        'VBR_ENTRAID_DATABASE_INSTALL': vbr_entra_id_install,
+        'VBR_SQLSERVER_ENGINE': sql_engine,
+        'VBR_SQLSERVER_SERVER': sql_instance if not sql_express_setup else '',
+        'VBR_SQLSERVER_DATABASE': sql_database,
+        'VBR_SQLSERVER_AUTHENTICATION': sql_authentication if not sql_express_setup else '',
+        'VBR_SQLSERVER_USERNAME': sql_username if sql_authentication == '1' else '',
+        'VBR_SQLSERVER_PASSWORD': sql_password if sql_authentication == '1' else '',
+        'VBRC_SERVICE_PORT': (catalog_service_port | string) if catalog_service_port is defined else '',
+        'VBR_SERVICE_PORT': (vbr_service_port | string) if vbr_service_port is defined else '',
+        'VBR_SECURE_CONNECTIONS_PORT': (vbr_secure_connections_port | string) if vbr_secure_connections_port is defined else '',
+        'VBR_RESTSERVICE_PORT': (vbr_rest_api_port | string) if vbr_rest_api_port is defined else '',
+        'INSTALLDIR': vbr_install_directory if vbr_install_directory is defined else '',
+        'VM_CATALOGPATH': catalog_path if catalog_path is defined else '',
+        'VBR_IRCACHE': instant_recovery_cache_path if instant_recovery_cache_path is defined else '',
+        'VBR_CHECK_UPDATES': vbr_check_updates,
+        'AHV_INSTALL': vbr_ahv_install,
+        'RHV_INSTALL': vbr_rhv_install,
+        'KVM_INSTALL': vbr_kvm_install,
+        'PVE_INSTALL': vbr_pve_install,
+        'AWS_INSTALL': vbr_aws_install,
+        'AZURE_INSTALL': vbr_azure_install,
+        'GCP_INSTALL': vbr_gcp_install,
+        'KASTEN_INSTALL': vbr_kasten_install,
+        'REBOOT_IF_REQUIRED': '0'
+      } | to_json | b64encode }}
+  when: vbr_full_version is match('^13\\.1\\.0\\.')
 
 # INSTALLING VEEAM SOFTWARE
 - name: Install Veeam Backup & Replication
@@ -32,16 +173,17 @@
     path: "{{ source }}Setup\\Silent\\Veeam.Silent.Install.exe"
     state: present
     arguments: '/AnswerFile "{{ destination }}VbrAnswerFile_install.xml" /SkipNetworkLogonErrors /LogFolder "{{ destination }}logs"'
-  async: "{{ veeam_retries * 60 | int }}" # see main.yml for more info
+  async: "{{ veeam_retries * 60 | int }}"  # see main.yml for more info
   poll: 0
   register: async_result
 - name: Check on Veeam Backup & Replication install status
   ansible.builtin.async_status:
     jid: "{{ async_result.ansible_job_id }}"
   register: async_poll_results
-  until: async_poll_results.finished
-  retries: "{{ veeam_retries | int }}" # see main.yml for more info
-  delay: 60 # 60 retries + 60 seconds = max 1 hour wait time
+  no_log: true
+  until: async_poll_results.finished | bool
+  retries: "{{ veeam_retries | int }}"  # see main.yml for more info
+  delay: 60  # 60 retries + 60 seconds = max 1 hour wait time
 
 # POST-INSTALL TASKS
 - name: Unmount ISO
