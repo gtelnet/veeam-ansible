@@ -43,8 +43,7 @@
   ansible.builtin.set_fact:
     legacy: true
   when:
-    - file.matched == 0
-    - file_version.win_file_version.file_version == '1.0.0.0'
+    - file.matched == 0 or file_version.win_file_version.file_version == '1.0.0.0'
 
 # Print Installation Configuration
 - name: Print Installation Configuration
